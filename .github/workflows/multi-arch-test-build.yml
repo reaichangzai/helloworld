@@ -13,8 +13,10 @@ jobs:
         include:
           - arch: aarch64_cortex-a53
             target: mvebu-cortexa53
-
-
+          - arch: arm_cortex-a9
+            target: mvebu-cortexa9
+          - arch: x86_64
+            target: x86-64
 
     steps:
       - name: Free Disk Space
@@ -49,31 +51,43 @@ jobs:
             grep -v ".*/src/Makefile" | \
             sed -e 's@./\(.*\)/Makefile@\1/@')
           
+          echo "Found package roots: $PKG_ROOTS"
+          
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             BASE_REF="origin/${BRANCH}"
           else
-            BASE_REF="HEAD^"
+            # 检查是否有前一个提交 - 这是关键修复！
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              BASE_REF="HEAD^"
+            else
+              BASE_REF=""
+            fi
           fi
           
-          CHANGES=$(git diff --diff-filter=d --name-only $BASE_REF HEAD)
-
           PACKAGES=""
-          for ROOT in $PKG_ROOTS; do
-            for CHANGE in $CHANGES; do
-              if [[ "$CHANGE" == "$ROOT"* ]]; then
-                PACKAGE_NAME=$(echo "$ROOT" | sed -e 's@\(.*\)/@\1@')
-                PACKAGES="$PACKAGES $PACKAGE_NAME"
-                break
-              fi
-            done
-          done
           
-          # fallback to test packages if nothing explicitly changes
-          PACKAGES="${PACKAGES:-luci-app-ssr-plus}"
-          # clear spaces
-          PACKAGES=$(echo $PACKAGES | xargs)
+          if [ -z "$BASE_REF" ]; then
+            echo "首次提交，使用默认包"
+            PACKAGES="luci-app-ssr-plus"
+          else
+            echo "Comparing $BASE_REF with HEAD"
+            CHANGES=$(git diff --diff-filter=d --name-only $BASE_REF HEAD 2>/dev/null || echo "")
 
-          echo "Building $PACKAGES"
+            for ROOT in $PKG_ROOTS; do
+              for CHANGE in $CHANGES; do
+                if [[ "$CHANGE" == "$ROOT"* ]]; then
+                  PACKAGE_NAME=$(echo "$ROOT" | sed -e 's@\(.*\)/@\1@')
+                  PACKAGES="$PACKAGES $PACKAGE_NAME"
+                  break
+                fi
+              done
+            done
+            
+            PACKAGES="${PACKAGES:-luci-app-ssr-plus}"
+          fi
+          
+          PACKAGES=$(echo $PACKAGES | xargs)
+          echo "Final packages to build: $PACKAGES"
           echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
 
       - name: Build
@@ -85,8 +99,35 @@ jobs:
           target: ${{ matrix.target }}
           packages: ${{ env.PACKAGES }}
 
+      - name: Check build output
+        run: |
+          echo "=== Checking build output ==="
+          if [ -d "bin/packages/${{ matrix.arch }}" ]; then
+            echo "✓ Build output directory exists"
+            find bin/packages/${{ matrix.arch }} -type f | head -20
+          else
+            echo "✗ ERROR: Build output directory not found"
+            ls -la bin/ 2>/dev/null || echo "No bin directory"
+            exit 1
+          fi
+
       - name: Move created packages to project dir
-        run: cp bin/packages/${{ matrix.arch }}/packages_ci/*.ipk . || true
+        run: |
+          echo "=== Moving IPK packages ==="
+          if ls bin/packages/${{ matrix.arch }}/packages_ci/*.ipk 1> /dev/null 2>&1; then
+            echo "✓ Found IPK files, copying..."
+            cp bin/packages/${{ matrix.arch }}/packages_ci/*.ipk . || true
+            ls -lh *.ipk 2>/dev/null
+          else
+            echo "⚠ WARNING: No IPK files found"
+            find bin/packages -name "*.ipk" -type f 2>/dev/null | head -20 || echo "No IPK files found"
+            
+            if [ -d "logs" ]; then
+              echo ""
+              echo "=== Last 50 lines of build logs ==="
+              find logs -name "*.log" -type f -exec tail -50 {} + 2>/dev/null || true
+            fi
+          fi
 
       - name: Collect metadata
         run: |
@@ -97,7 +138,11 @@ jobs:
             HEAD_ID=$(git rev-parse --short HEAD)
             PRNUMBER=${GITHUB_REF_NAME%/merge}
           else
-            BASE_ID=$(git rev-parse --short HEAD^)
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              BASE_ID=$(git rev-parse --short HEAD^)
+            else
+              BASE_ID="initial"
+            fi
             HEAD_ID=$MERGE_ID
             PRNUMBER="push-$MERGE_ID"
           fi
@@ -135,19 +180,21 @@ jobs:
 
           echo >> PKG-INFO
           echo "Package count: ${#IPKS[@]}" >> PKG-INFO
-          echo "Package size summary:" >> PKG-INFO
-          for f in "${IPKS[@]}"; do
-            du -sh "$f" >> PKG-INFO
-          done
-
-          if [ ${#IPKS[@]} -eq 0 ]; then
-            echo "No packages built." >> PKG-INFO
+          
+          if [ ${#IPKS[@]} -gt 0 ]; then
+            echo "Package size summary:" >> PKG-INFO
+            for f in "${IPKS[@]}"; do
+              du -sh "$f" >> PKG-INFO
+            done
+          else
+            echo "⚠ WARNING: No IPK packages were generated" >> PKG-INFO
           fi
 
           cat PKG-INFO
 
       - name: Store packages
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ env.ARCHIVE_NAME }}-packages
           path: |
@@ -158,6 +205,7 @@ jobs:
 
       - name: Store logs
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ env.ARCHIVE_NAME }}-logs
           path: |
